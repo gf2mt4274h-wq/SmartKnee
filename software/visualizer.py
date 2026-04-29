@@ -1,123 +1,153 @@
-import numpy as np
-import serial
-import threading
+'''
+Date: 27 Apr 2026
+Author: Zhiheng Yang
+This code is created for debugging and visualization only, not relevant to model training
+'''
 import cv2
+import time
+import serial
+import struct
+import numpy as np
 from collections import deque
 
-# ===================== 配置参数 =====================
-PORT = '/dev/cu.usbserial-140'  # macOS通常是 /dev/cu.usbserial-xxx
+# serial config
+PORT = '/dev/cu.usbserial-1401'
 BAUD = 2000000
-ROW_COUNT = 16
-COLUMN_COUNT = 16
-THRESHOLD = 5  # 基础噪声阈值
-NOISE_SCALE = 60  # 归一化比例因子
 
-# 窗口设置
-HEATMAP_SCALE = 30  # 放大倍数
-MAX_PLOT_POINTS = 100
+# binary config
+HEADER = b'st'
+buffer = b''
+FORMAT = '<2sf512B'                                  # 2 (char number of head) + 1 (float angle) + 512 (2 * 256 pixel data from knee and foot)
+FORMAT_LEN = struct.calcsize(FORMAT)                 # this confines one frame's length
 
-# ===================== 全局变量 =====================
-# 存储当前正在构建的 16x16 矩阵
-raw_matrix = np.zeros((ROW_COUNT, COLUMN_COUNT))
-# 存储处理后用于显示的数据
-contact_data_norm = np.zeros((ROW_COUNT, COLUMN_COUNT))
-# 标定用
-calibration_buffer = []
-calibrated_median = np.zeros((ROW_COUNT, COLUMN_COUNT))
-is_calibrated = False
+# heatmap config
+PIXEL_SIZE = 30                                      # define the side length of a single pixel in the heatmap
+HEAT_THRESHOLD = 5
+NOISE_SCALE = 10
+NUM = 16                                             # define the side length of our square heatmap
+pixel = []
+
+# line chart config
+WINDOW_LEN = 150                                     # the actual length of the window
+WINDOW_WIDTH = 150                                   # the number of points within window
+WINDOW_HEIGHT = 50                                   # the actual height of the window
+WINDOW = deque([0.0] * WINDOW_WIDTH, maxlen=WINDOW_WIDTH)
+ANGLE_THRESHOLD = 1
+angle = 0.0
+
+# flagging config
+FLAG = False
+FLAG_NUM = 30                                        # we'll use first 30 frame as base for calibration
+FLAG_COUNT = 0
+base_angle = 0.0                                     # create a float to store flag angle
+base_pixel = np.zeros(512)                           # create a 512 zeros array to store flag pixel
+base_angle_set = []
+base_pixel_set = []
+
+def processSerial(ser):
+    global base_angle_set, base_pixel_set, base_angle, base_pixel, buffer, angle, pixel, FLAG, FLAG_NUM, FLAG_COUNT
+
+    while ser.in_waiting > 0:                        # if there are any data that are waiting for received
+        buffer += ser.read(ser.in_waiting)
+        while len(buffer) >= FORMAT_LEN:             # try process buffer when possible
+            header_idx = buffer.find(HEADER)
+            if header_idx == -1:                     # no header, indicating a null data
+                buffer = b''                         # throw these trash data
+                break                                # shift to next loop to collect more data
+
+            if header_idx > 0:                       # header isn't at the first position
+                buffer = buffer[header_idx:]         # we only want data that start with header
+                if len(buffer) < FORMAT_LEN:         # indicating incomplete data
+                    break                            # shift to next loop to collect more data
+
+            # now, out buffer begin with header with at least one complete frame
+            frame = buffer[:FORMAT_LEN]              # cut one frame's data
+            unpacked = struct.unpack(FORMAT, frame)  # we unpack this frame's data from binary format
+            buffer = buffer[FORMAT_LEN:]             # shift to next frame
+            if FLAG_COUNT < 30:
+                base_angle_set.append(unpacked[1])
+                base_pixel_set.append(unpacked[2:])
+                FLAG_COUNT += 1
+                print(f'Calibration: {FLAG_COUNT}/{FLAG_NUM}', end='\r')
+                return                               # brutally jump out of the function
+
+            print('Calibration complete')
+            FLAG = True                              # if code can execute up to this point, then we can be confident that flagging is complete
+            base_angle = np.median(base_angle_set)
+            base_pixel = np.median(np.array(base_pixel_set), axis=0)
+
+            angle = unpacked[1] - base_angle         # cuz frame[0] is the header
+            angle = np.clip(angle, 0, 180)
+
+            # the following data are 512 pixels' pressure, and we don't need to separate knee and foot
+            pixel = np.array(unpacked[2:]) - base_pixel
+            pixel = np.clip(pixel, 0, 255)
+
+            if np.max(pixel) < HEAT_THRESHOLD:
+                pixel *= NOISE_SCALE                 # amplifying peaceful event for visual-friendly purpose
+
+            WINDOW.append(angle)                     # add this frame's angle to deque
 
 
-def readThread(serDev):
-    global raw_matrix, contact_data_norm, is_calibrated, calibrated_median, calibration_buffer
+def line_chart_plotter():
+    point_coordinates = []                           # this list store values of every angle within the window
+    canvas = np.zeros(shape=(WINDOW_HEIGHT, WINDOW_LEN, 3), dtype=np.uint8)  # height, width, RGB
 
-    serDev.flushInput()
-    line_count = 0
+    if len(WINDOW) < 2:
+        return canvas                                # return directly since we cannot plot a single dot or empty
+    for i, val in enumerate(WINDOW):                 # grab both index and angle inside the window
+        cv2.putText(canvas,
+                    f'Knee angle: {val:.2f} degrees',
+                    (20, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 255),           # set background as black
+                    2)
+        x = i * (WINDOW_LEN / WINDOW_WIDTH)          # distribute every dot uniformly
+        y = WINDOW_HEIGHT * (1 - val / 180.0)        # cuz the y-coordinate at top is 0, so we need to flip it
+        point_coordinates.append((x, y))             # add tuple containing x, y
 
-    while True:
-        if serDev.in_waiting > 0:
-            try:
-                # 读取一行，例如 "R0:12,13,44..."
-                raw_line = serDev.readline().decode('utf-8').strip()
-                if not raw_line or ":" not in raw_line:
-                    continue
+    for i in range(len(point_coordinates) - 1):
+        # connect every adjacent dots by using yellow lines with thick 2
+        cv2.line(canvas, point_coordinates[i], point_coordinates[i+1], (0, 255, 255), 2)
 
-                # 1. 解析行号和数据
-                parts = raw_line.split(":")
-                row_idx = int(parts[0].replace("R", ""))  # 提取数字行号
-                vals = [int(v) for v in parts[1].split(",")]  # 提取16个数据
-
-                if len(vals) == COLUMN_COUNT:
-                    raw_matrix[row_idx] = vals
-
-                    # 2. 如果收到最后一行 (R15)，说明一帧扫描完成
-                    if row_idx == ROW_COUNT - 1:
-                        process_frame()
-            except Exception as e:
-                print(f"数据解析错误: {e}")
-                continue
+    time.sleep(0.01)                                 # give CPU a short break, increasing robustness
+    cv2.imshow('Knee angle line chart (live)', canvas)
 
 
-def process_frame():
-    global is_calibrated, calibrated_median, calibration_buffer, contact_data_norm
+def heatmap_painter():
+    # transform num list to 16 * 16 grid by 0~255 int, corresponding with RGB scale
+    knee_matrix = np.array(pixel[:256]).astype(np.uint8).reshape(16, 16)
+    foot_matrix = np.array(pixel[256:]).astype(np.uint8).reshape(16, 16)
+    knee_heatmap = cv2.resize(knee_matrix,
+        (NUM * PIXEL_SIZE, NUM * PIXEL_SIZE),  # define the heatmap's side length under the pixel dimension
+        interpolation=cv2.INTER_NEAREST)             # Fill center color to all the grid to make pure color grids
+    foot_heatmap = cv2.resize(foot_matrix,
+        (NUM * PIXEL_SIZE, NUM * PIXEL_SIZE),
+        interpolation=cv2.INTER_NEAREST)
 
-    current_frame = raw_matrix.copy()
+    knee_colormap = cv2.applyColorMap(knee_heatmap, cv2.COLORMAP_JET)
+    foot_colormap = cv2.applyColorMap(foot_heatmap, cv2.COLORMAP_JET)
 
-    # 3. 自动标定逻辑 (前30帧取中值)
-    if not is_calibrated:
-        calibration_buffer.append(current_frame)
-        if len(calibration_buffer) >= 30:
-            calibrated_median = np.median(np.array(calibration_buffer), axis=0)
-            is_calibrated = True
-            print(">>> 标定成功！传感器已就绪")
-    else:
-        # 4. 去除基准噪声并归一化
-        # 原始值 - 背景中值 - 阈值
-        processed = current_frame - calibrated_median - THRESHOLD
-        processed = np.clip(processed, 0, 255)  # 限制在正数范围
-
-        # 归一化逻辑
-        max_val = np.max(processed)
-        if max_val < THRESHOLD:
-            contact_data_norm = processed / NOISE_SCALE
-        else:
-            contact_data_norm = processed / max_val
+    time.sleep(0.01)
+    cv2.imshow('Knee Heatmap (pixelated)', knee_colormap)
+    cv2.imshow('Feet Heatmap (pixelated)', foot_colormap)
 
 
 if __name__ == '__main__':
+    serial_data = serial.Serial(PORT, BAUD, timeout=0.1)
     try:
-        serDev = serial.Serial(PORT, BAUD, timeout=1)
-        print(f"成功连接到端口: {PORT}")
-    except:
-        print(f"无法打开端口 {PORT}，请检查设备连接或权限。")
-        exit()
+        while True:
+            processSerial(serial_data)
+            if FLAG:                                 # the following will proceed only when flag is complete
+                line_chart_plotter()
+                heatmap_painter()
 
-    serialThread = threading.Thread(target=readThread, args=(serDev,))
-    serialThread.daemon = True
-    serialThread.start()
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
-    cv2.namedWindow("ESP-NOW Matrix Heatmap", cv2.WINDOW_NORMAL)
-
-    while True:
-        if is_calibrated:
-            # 将 0-1 的浮点矩阵转为 0-255 的图像
-            heatmap_img = (contact_data_norm * 255).astype(np.uint8)
-
-            # 放大 (INTER_NEAREST 保持颗粒感)
-            display_img = cv2.resize(heatmap_img,
-                                     (COLUMN_COUNT * HEATMAP_SCALE, ROW_COUNT * HEATMAP_SCALE),
-                                     interpolation=cv2.INTER_NEAREST)
-
-            # 应用伪彩色 (JET色图：红热蓝冷)
-            color_map = cv2.applyColorMap(display_img, cv2.COLORMAP_JET)
-
-            # 添加文字提示
-            cv2.putText(color_map, "Press 'Q' to Exit", (10, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-            cv2.imshow("ESP-NOW Matrix Heatmap", color_map)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    serDev.close()
-    cv2.destroyAllWindows()
+    except Exception as e:
+        print(f'Trace back (most recent call last): {e}')
+    finally:                                         # execute 100% regardless whether previous error exist or not
+        serial_data.close()
+        cv2.destroyAllWindows()
